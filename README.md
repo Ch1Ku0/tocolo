@@ -45,3 +45,18 @@ To perform code localization for user reviews:
 
 &ensp; &ensp; 3. Similarity Calculation: Compute the similarity between the review and each method-level snippet in the recalled files. The similarity scores are used to produce the final method-level localization results.
 
+
+### Data & Code File Descriptions
+
+`data`: Contains datasets required for fine-tuning and inference.
+
+project_name_train.json: Used for fine-tuning the model.
+
+project_name_valid.json: Used for validation during fine-tuning.
+
+project_name_test.json: Used for inference.
+
+`code_file_description`: Contains LLM-generated descriptions for code files.
+
+The datasets and code file descriptions can be downloaded from https://pan.baidu.com/s/1YCTGFSmmHWrLUDZkDedB5w password: pzdj
+
