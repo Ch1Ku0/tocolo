@@ -39,13 +39,15 @@ from collections import defaultdict, deque
 import itertools
 from collections import Counter
 from rankbm25 import get_best_matching_keys
+import math
 
-project_alpha_k_dict = {
-    "AntennaPod": 37,
-    "k9mail":  57,
-    "cgeo": 47,
-    "anki": 38,
-    "termux": 5
+
+project_file_count_dict = {
+    "AntennaPod": 378,
+    "k9mail":  571,
+    "cgeo": 477,
+    "anki": 381,
+    "termux": 52
 }
 
 
@@ -136,12 +138,7 @@ def train(args, model, tokenizer):
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,num_workers=4)
 
-    #get optimizer and scheduler
-    # params = []
-    # for n, p in model.named_parameters():
-    #     if 'adapter' in n:
-    #         params.append(p)
-    # optimizer = AdamW(params, lr=args.learning_rate, eps=1e-8)
+
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = len(train_dataloader) * args.num_train_epochs)
 
@@ -173,15 +170,10 @@ def train(args, model, tokenizer):
             scores = torch.einsum("ab,cb->ac",nl_vec,code_vec)
             loss_fct = CrossEntropyLoss()
 
-        
-
-
+    
             loss = loss_fct(scores*20, torch.arange(code_inputs.size(0), device=scores.device))
 
 
-
-
-            
             #report loss
             tr_loss += loss.item()
             tr_num += 1
@@ -198,7 +190,7 @@ def train(args, model, tokenizer):
             scheduler.step() 
             
         #evaluate    
-        method_MRR = evaluate(args, model, tokenizer,args.eval_data_file, eval_when_training=True)
+        method_MRR = evaluate_valid(args, model, tokenizer,args.eval_data_file, eval_when_training=True)
         # for key, value in results.items():
         #     logger.info("  %s = %s", key, round(value,4))    
             
@@ -220,15 +212,102 @@ def train(args, model, tokenizer):
 
 
 
+def evaluate_valid(args, model, tokenizer,file_name,eval_when_training=False):
+
+    model.eval()
+    # 加载关系文件
+    review_file = open(args.eval_data_file, "rb")
+    reviews = json.load(review_file)
+
+    code_file = open(args.eval_data_file, "rb")
+    codes = json.load(code_file)
+
+
+
+    review_vec_dict = {}
+    for idx, review_dic in enumerate(reviews):
+        review_content = review_dic['review_raw']
+        query_vec = model(tokenizer(review_content, return_tensors='pt',
+                                          max_length=128, truncation=True)['input_ids'].to(args.device))
+        review_vec_dict[review_content] = query_vec.detach().cpu()
+    
+    code_vec_list = torch.zeros(len(codes), 768)
+    code_information_list = []
+    code_id_list = []
+    code_id_dict = {}
+    method2path = dict()
+
+
+
+    for idx, code_dic in enumerate(codes):
+        code_content = code_dic['method_content']
+        code_vec = model(tokenizer(code_content, return_tensors='pt',
+                                        max_length=256, truncation=True)['input_ids'].to(args.device))
+        code_vec_list[idx] = code_vec.detach().cpu()
+        
+        code_path = code_dic['method_path']
+        code_name = code_dic['method_name']
+        code_id = code_path + "#" + code_name
+        code_information_list.append((code_id, code_path, code_name, code_content))
+        code_id_list.append(code_id)
+        method2path[code_id] = code_path
+        code_id_dict[code_id] = idx
+
+
+    ranks = []
+    for idx, review_dic in enumerate(reviews):
+        # 获取到review
+        review_content = review_dic['review_raw']
+        
+        query_vec_list = torch.zeros(1, 768)
+        query_vec_list[0] = review_vec_dict[review_content]
+
+        scores = torch.einsum("ab,cb->ac", query_vec_list, code_vec_list)
+        scores = scores.detach().cpu().numpy()
+        sort_id_list = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:, ::-1]
+
+        # 获取该review对应的method
+        real_methods_list = []
+        code_path = review_dic['method_path']
+        code_name = review_dic['method_name']
+        code_id = code_path + "#" + code_name
+        real_methods_list.append(code_id)
+ 
+        sort_id = sort_id_list[0]
+
+        rank = 0
+        find = False
+        # print(sort_id[:10])
+        for idx in sort_id[:1000]:
+            method_path = code_information_list[idx][1]
+            method_name = code_information_list[idx][2]
+            code_content = code_information_list[idx][3]
+
+            if find is False:
+                rank += 1
+            if method_path + '#' + method_name in real_methods_list:
+                find = True
+
+                ranks.append(1 / rank)
+                break
+        if not find:
+            ranks.append(0)
+        # print("rank = " + str(rank))
+
+    method_MRR = np.mean(ranks)
+
+    return method_MRR
+    
+
+
 def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
 
 
     model.eval()
-    # alpha_k = args.alpha_k
-    # print("alpha_k : " + str(alpha_k))
+
     project_name = args.project_name
 
-    alpha_k = project_alpha_k_dict[project_name]
+    alpha_k = math.floor(project_file_count_dict[project_name] * args.alpha_k)
     # 加载关系文件
     review_file = open(args.eval_data_file, "rb")
     reviews = json.load(review_file)
@@ -273,17 +352,37 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
             code_vec_dict[code_id] = code_vec.detach().cpu()
             code_id_list.append(code_id)
 
-        
-
-
+ 
     with open(project_name + '_commit_count.json', 'r') as file:
-        AntennaPod_method_path_count = json.load(file)
+        project_method_path_count = json.load(file)
 
-
-    with open(project_name + '_filename_intro_for_chatgbt.json', 'r') as file:
+    with open(project_name + '_code_file_description.json', 'r') as file:
         corpus = json.load(file)
 
 
+    method_NDCG_list_3 = []
+    method_NDCG_list_5 = []
+    method_NDCG_list_10 = []
+    method_NDCG_list_20 = []
+
+    method_Recall_list_3 = []
+    method_Recall_list_5  = []
+    method_Recall_list_10 = []
+    method_Recall_list_20 = []
+
+    method_AP_list_3 = []
+    method_AP_list_5 = []
+    method_AP_list_10 = []
+    method_AP_list_20 = []
+
+    file_AP_list_3 = []
+    file_AP_list_5 = []
+    file_AP_list_10 = []
+    file_AP_list_20 = []
+
+    misclassified_pairs_dict = {}
+
+    misclassified_review_list = []
 
     ranks = []
     file_ranks = []
@@ -304,7 +403,7 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
         query_vec_list = torch.zeros(1, 768)
         query_vec_list[0] = review_vec_dict[review_content]
         # 通过review进行召回文件名
-        best_keys = get_best_matching_keys(review_content, corpus, AntennaPod_method_path_count, top_n=alpha_k)
+        best_keys = get_best_matching_keys(review_content, corpus, project_method_path_count, top_n=alpha_k)
 
         # print(review_content + "已经完成召回")
 
@@ -336,13 +435,9 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
             codes_idx += 1
             code_id_dict[code_id] = codes_idx
 
-
-
         scores = torch.einsum("ab,cb->ac", query_vec_list, code_vec_list)
         scores = scores.detach().cpu().numpy()
         sort_id_list = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:, ::-1]
-
-
 
         # 获取该review对应的method_list
         real_methods_list = review_dic['method_list']
@@ -357,7 +452,7 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
         new_real_file_list = list(new_real_file_set)
 
         # 计算file_ranks MRR
-        file_best_keys = get_best_matching_keys(review_content, corpus, AntennaPod_method_path_count, top_n=len(codes_file2method_dict.keys()))
+        file_best_keys = get_best_matching_keys(review_content, corpus, project_method_path_count, top_n=len(codes_file2method_dict.keys()))
         file_rank = 0
         file_find = False
         for file_path_bm25 in file_best_keys:
@@ -380,6 +475,42 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
                 break
         if not file_find:
             file_ranks.append(0)
+
+
+        cutoffs = [3, 5, 10, 20]
+        max_k = max(cutoffs)
+
+        num_relevant = 0
+        found_files = set()
+
+        precision_sum_at_k = {k: 0.0 for k in cutoffs}
+
+        for rank_idx, file_path_bm25 in enumerate(file_best_keys[:max_k], start=1):
+            method_path = file_path_bm25
+
+            if method_path in new_real_file_set and method_path not in found_files:
+                found_files.add(method_path)
+                num_relevant += 1
+                precision = num_relevant / rank_idx
+
+                for k in cutoffs:
+                    if rank_idx <= k:
+                        precision_sum_at_k[k] += precision
+
+        # 计算 AP@K（与你原来完全一致的公式）
+        if len(new_real_file_set) > 0:
+            AP_3 = precision_sum_at_k[3] / len(new_real_file_set)
+            AP_5 = precision_sum_at_k[5] / len(new_real_file_set)
+            AP_10 = precision_sum_at_k[10] / len(new_real_file_set)
+            AP_20 = precision_sum_at_k[20] / len(new_real_file_set)
+        else:
+            AP_3 = AP_5 = AP_10 = AP_20 = 0
+
+        file_AP_list_3.append(AP_3)
+        file_AP_list_5.append(AP_5)
+        file_AP_list_10.append(AP_10)
+        file_AP_list_20.append(AP_20)
+
 
         sort_id = sort_id_list[0]
 
@@ -431,25 +562,146 @@ def evaluate(args, model, tokenizer,file_name,eval_when_training=False):
         if len(set(new_real_method_list) & set(pre_methods_list[:20])) != 0:
             top20_hitting += 1
 
+        cutoffs = [3, 5, 10, 20]
+        max_k = max(cutoffs)
+
+        # ===== 初始化 =====
+        num_relevant = 0
+        found_relevant = set()  # 已命中的真实相关方法
+
+        precision_sum_at_k = {k: 0.0 for k in cutoffs}
+        recall_at_k = {k: 0.0 for k in cutoffs}
+
+        dcg_at_k = {k: 0.0 for k in cutoffs}
+        idcg_at_k = {k: 0.0 for k in cutoffs}
+
+        # ===== 主循环：遍历排序结果 =====
+        for rank_idx, idx in enumerate(sort_id[:max_k], start=1):
+            method_path = code_information_list[idx][1]
+            method_name = code_information_list[idx][2]
+            code_id = method_path + '#' + method_name
+
+            # ===== NDCG：DCG =====
+            gain = 1.0 if code_id in new_real_method_set else 0.0
+            for k in cutoffs:
+                if rank_idx <= k:
+                    dcg_at_k[k] += gain / math.log2(rank_idx + 1)
+
+            # ===== MAP =====
+            if code_id in new_real_method_set and code_id not in found_relevant:
+                found_relevant.add(code_id)
+                num_relevant += 1
+                precision = num_relevant / rank_idx
+
+                for k in cutoffs:
+                    if rank_idx <= k:
+                        precision_sum_at_k[k] += precision
+
+        # ===== AP@K =====
+        total_relevant = len(new_real_method_set)
+
+        if total_relevant > 0:
+            AP_at_k = {
+                k: precision_sum_at_k[k] / total_relevant
+                for k in cutoffs
+            }
+        else:
+            AP_at_k = {k: 0.0 for k in cutoffs}
+
+        # ===== Recall@K（覆盖率型，严格正确）=====
+        retrieved_ids = [
+            code_information_list[idx][1] + '#' + code_information_list[idx][2]
+            for idx in sort_id[:max_k]
+        ]
+
+        for k in cutoffs:
+            hit_count = len(set(retrieved_ids[:k]).intersection(new_real_method_set))
+            recall_at_k[k] = hit_count / total_relevant if total_relevant > 0 else 0.0
+
+        # ===== NDCG：IDCG =====
+        for k in cutoffs:
+            ideal_hits = min(total_relevant, k)
+            for i in range(1, ideal_hits + 1):
+                idcg_at_k[k] += 1.0 / math.log2(i + 1)
+
+        ndcg_at_k = {
+            k: (dcg_at_k[k] / idcg_at_k[k]) if idcg_at_k[k] > 0 else 0.0
+            for k in cutoffs
+        }
+
+        # ===== 保存结果 =====
+        method_AP_list_3.append(AP_at_k[3])
+        method_AP_list_5.append(AP_at_k[5])
+        method_AP_list_10.append(AP_at_k[10])
+        method_AP_list_20.append(AP_at_k[20])
+
+        method_Recall_list_3.append(recall_at_k[3])
+        method_Recall_list_5.append(recall_at_k[5])
+        method_Recall_list_10.append(recall_at_k[10])
+        method_Recall_list_20.append(recall_at_k[20])
+
+        method_NDCG_list_3.append(ndcg_at_k[3])
+        method_NDCG_list_5.append(ndcg_at_k[5])
+        method_NDCG_list_10.append(ndcg_at_k[10])
+        method_NDCG_list_20.append(ndcg_at_k[20])
+
+    method_NDCG_3 = np.mean(method_NDCG_list_3)
+    method_NDCG_5 = np.mean(method_NDCG_list_5)
+    method_NDCG_10 = np.mean(method_NDCG_list_10)
+    method_NDCG_20 = np.mean(method_NDCG_list_20)
+
+    method_MAP_3 = np.mean(method_AP_list_3)
+    method_MAP_5 = np.mean(method_AP_list_5)
+    method_MAP_10 = np.mean(method_AP_list_10)
+    method_MAP_20 = np.mean(method_AP_list_20)
+
+
+    file_MAP_3 = np.mean(file_AP_list_3)
+    file_MAP_5 = np.mean(file_AP_list_5)
+    file_MAP_10 = np.mean(file_AP_list_10)
+    file_MAP_20 = np.mean(file_AP_list_20)
+
     method_MRR = np.mean(ranks)
-    file_MRR = np.mean(file_ranks)
-    # print('Method_ranks:', ranks)
-    print('Method_MRR:', str(np.mean(ranks)))
-    print('Method_Top1_MRR:', str(top1_hitting / len(reviews)))
-    print('Method_Top3_MRR:', str(top3_hitting / len(reviews)))
-    print('Method_Top5_MRR:', str(top5_hitting / len(reviews)))
-    print('Method_Top10_MRR:', str(top10_hitting / len(reviews)))
-    print('Method_Top20_MRR:', str(top20_hitting / len(reviews)))
-    print('File_MRR:', str(np.mean(file_ranks)))
-    print('File_Top1_MRR:', str(file_top1_hitting / len(reviews)))
-    print('File_Top3_MRR:', str(file_top3_hitting / len(reviews)))
-    print('File_Top5_MRR:', str(file_top5_hitting / len(reviews)))
-    print('File_Top10_MRR:', str(file_top10_hitting / len(reviews)))
-    print('File_Top20_MRR:', str(file_top20_hitting / len(reviews)))
+
+
+    print_metric("Method_Top1_MRR:", top1_hitting / len(reviews))
+    print_metric("Method_Top3_MRR:", top3_hitting / len(reviews))
+    print_metric("Method_Top5_MRR:", top5_hitting / len(reviews))
+    print_metric("Method_Top10_MRR:", top10_hitting / len(reviews))
+    print_metric("Method_Top20_MRR:", top20_hitting / len(reviews))
+
+    print_metric("Method_MAP@3 :", method_MAP_3)
+    print_metric("Method_MAP@5 :", method_MAP_5)
+    print_metric("Method_MAP@10:", method_MAP_10)
+    print_metric("Method_MAP@20:", method_MAP_20)
+
+    print_metric("Method_NDCG@3 :", method_NDCG_3)
+    print_metric("Method_NDCG@5 :", method_NDCG_5)
+    print_metric("Method_NDCG@10:", method_NDCG_10)
+    print_metric("Method_NDCG@20:", method_NDCG_20)
+
+    print_metric("Method_MRR:", np.mean(ranks))
+
+
+    print_metric("File_Top1_MRR:", file_top1_hitting / len(reviews))
+    print_metric("File_Top3_MRR:", file_top3_hitting / len(reviews))
+    print_metric("File_Top5_MRR:", file_top5_hitting / len(reviews))
+    print_metric("File_Top10_MRR:", file_top10_hitting / len(reviews))
+    print_metric("File_Top20_MRR:", file_top20_hitting / len(reviews))
+
+    print_metric("File_MAP@3 :", file_MAP_3)
+    print_metric("File_MAP@5 :", file_MAP_5)
+    print_metric("File_MAP@10:", file_MAP_10)
+    print_metric("File_MAP@20:", file_MAP_20)
+
+    print_metric("File_MRR:", np.mean(file_ranks))
 
 
     return method_MRR
     
+
+def print_metric(name, value):
+    print(f"{name}: {value:.3f}")
 
 
                    
@@ -557,10 +809,9 @@ def main():
             model_to_load = model.module if hasattr(model, 'module') else model  
             model_to_load.load_state_dict(torch.load(output_dir))      
         model.to(args.device)
-        result = evaluate(args, model, tokenizer,args.eval_data_file)
+        method_MRR = evaluate(args, model, tokenizer,args.eval_data_file)
         logger.info("***** Eval results *****")
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(round(result[key],3)))
+        logger.info("  method_MRR = %s", str(round(method_MRR,3)))
             
     if args.do_test:
         if args.do_zero_shot is False:
