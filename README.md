@@ -6,7 +6,7 @@ The workflow consists of three main stages: Preparation, Fine-tuning, and Infere
 
 ### 1. Preparation Stage
 
-The preparation stage is carried out by running `python interaction_with_chatgpt.py` and consists of two rounds of interaction with the LLM:
+The preparation stage is carried out by running `python generate_file_descriptions.py` and consists of two rounds of interaction with the LLM:
 
 &ensp; 1. First Round: The LLM analyzes the project’s directory structure and generates a global project summary, which serves as stable contextual information for all subsequent file-level analyses. This summary is fixed across all experiments, as it does not directly participate in retrieval and therefore does not affect downstream evaluation.
 
